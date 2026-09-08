@@ -1,0 +1,253 @@
+name: Build Joplin ARM64 Release
+
+"on":
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Joplin version, e.g. v3.7.16. Leave empty for latest."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: laurent22/joplin
+
+jobs:
+  check-release:
+    name: Check Official Release
+    runs-on: ubuntu-latest
+
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      version: ${{ steps.check.outputs.version }}
+
+    steps:
+      - name: Check upstream latest release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_VERSION: ${{ inputs.version }}
+        run: |
+          set -e
+
+          if [ -n "$MANUAL_VERSION" ]; then
+            VERSION="$MANUAL_VERSION"
+          else
+            VERSION=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq '.tag_name')
+          fi
+
+          echo "Joplin version: $VERSION"
+
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: Could not determine version."
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$VERSION" --repo ${{ github.repository }} >/dev/null 2>&1; then
+            echo "Release $VERSION already exists."
+            if [ "${{ github.event_name }}" = "schedule" ]; then
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "Manual or push trigger: building anyway to update assets."
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Release $VERSION does not exist."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ARM64 APK
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout official Joplin release
+        uses: actions/checkout@v4
+        with:
+          repository: laurent22/joplin
+          ref: ${{ needs.check-release.outputs.version }}
+          fetch-depth: 1
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/share/swift || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf /usr/local/share/powershell || true
+          docker system prune -af || true
+          df -h /
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "20"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install
+        env:
+          SKIP_ONENOTE_CONVERTER_BUILD: "1"
+
+      - name: Force ARM64 only
+        working-directory: packages/app-mobile/android
+        run: |
+          # 1. Update gradle.properties (Crucial for React Native New Arch)
+          sed -i 's/reactNativeArchitectures=.*/reactNativeArchitectures=arm64-v8a/' gradle.properties
+          echo "Updated gradle.properties:"
+          grep "reactNativeArchitectures" gradle.properties
+
+          # 2. Update build.gradle
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          path = Path("app/build.gradle")
+          text = path.read_text()
+
+          # Replace abiFilters list with just arm64-v8a
+          # Matches both: abiFilters "a", "b" and abiFilters 'a', 'b'
+          pattern = r'abiFilters\s+["\'][^"\']+["\'](?:,\s+["\'][^"\']+["\'])*'
+          if re.search(pattern, text):
+              text = re.sub(pattern, 'abiFilters "arm64-v8a"', text)
+              path.write_text(text)
+              print("Changed abiFilters in build.gradle to arm64-v8a")
+          else:
+              print("Warning: abiFilters pattern not found in build.gradle")
+
+          PY
+
+          grep -n "abiFilters" app/build.gradle
+
+      - name: Switch release signing to debug signing
+        working-directory: packages/app-mobile/android
+        run: |
+          sed -i \
+            's/signingConfig signingConfigs.release/signingConfig signingConfigs.debug/' \
+            app/build.gradle
+
+          echo "Signing configuration:"
+          grep -n "signingConfig" app/build.gradle || true
+
+      - name: Build Android Release
+        working-directory: packages/app-mobile/android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease
+
+      - name: Verify APK
+        working-directory: packages/app-mobile/android
+        run: |
+          set -e
+
+          APK="app/build/outputs/apk/release/app-release.apk"
+
+          if [ ! -f "$APK" ]; then
+            echo "ERROR: APK not found"
+            exit 1
+          fi
+
+          ls -lh "$APK"
+
+          echo "Checking native libraries..."
+
+          unzip -l "$APK" | grep "lib/" || true
+
+          if unzip -l "$APK" | grep -E \
+            "lib/(armeabi-v7a|x86|x86_64)/"; then
+            echo "ERROR: Non-ARM64 libraries found"
+            exit 1
+          fi
+
+          if ! unzip -l "$APK" | grep "lib/arm64-v8a/"; then
+            echo "ERROR: arm64-v8a libraries not found"
+            exit 1
+          fi
+
+          echo "ARM64 verification PASSED"
+
+      - name: Verify APK alignment
+        working-directory: packages/app-mobile/android
+        run: |
+          set -e
+
+          APK="./app/build/outputs/apk/release/app-release.apk"
+
+          ZIPALIGN_PATH=$(
+            find "$ANDROID_HOME/build-tools" \
+              -name "zipalign" \
+              -type f \
+              | sort \
+              | tail -n1
+          )
+
+          if [ ! -x "$ZIPALIGN_PATH" ]; then
+            echo "ERROR: zipalign not found"
+            exit 1
+          fi
+
+          "$ZIPALIGN_PATH" -c -P 16 -v 4 "$APK"
+
+      - name: Rename APK
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+          VERSION_NUMBER="${VERSION#v}"
+
+          cp \
+            packages/app-mobile/android/app/build/outputs/apk/release/app-release.apk \
+            "joplin-${VERSION_NUMBER}-arm64.apk"
+
+      - name: Generate SHA256
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+          VERSION_NUMBER="${VERSION#v}"
+
+          sha256sum \
+            "joplin-${VERSION_NUMBER}-arm64.apk" \
+            > \
+            "joplin-${VERSION_NUMBER}-arm64.apk.sha256"
+
+          cat "joplin-${VERSION_NUMBER}-arm64.apk.sha256"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+          VERSION_NUMBER="${VERSION#v}"
+          APK="joplin-${VERSION_NUMBER}-arm64.apk"
+          SHA="joplin-${VERSION_NUMBER}-arm64.apk.sha256"
+
+          if gh release view "$VERSION" --repo ${{ github.repository }} >/dev/null 2>&1; then
+            echo "Release $VERSION already exists, uploading assets..."
+            gh release upload "$VERSION" "$APK" "$SHA" --clobber --repo ${{ github.repository }}
+          else
+            echo "Creating new release $VERSION..."
+            gh release create "$VERSION" "$APK" "$SHA" \
+              --title "Joplin ${VERSION} ARM64" \
+              --generate-notes \
+              --repo ${{ github.repository }}
+          fi
